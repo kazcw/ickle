@@ -1,11 +1,115 @@
+pub mod vevent;
 use std::io::BufRead;
 use std::fmt::{self, Debug};
+
+macro_rules! define_identifier_set {
+    ( $Name:ident, $( $Tok:ident, $tok_name:expr ),* $(,)? ) => {
+        #[derive(Debug, PartialEq, Eq, Copy, Clone)]
+        pub enum $Name {
+            $( $Tok, )*
+        }
+        impl $Name {
+            fn from_bytes<'s>(s: &'s [u8]) -> std::result::Result<Self, &'s [u8]> {
+                use $Name::*;
+                Ok(match s {
+                    $( $tok_name => $Tok, )*
+                    _ => return Err(s)
+                })
+            }
+            pub fn as_str(self) -> &'static str {
+                use $Name::*;
+                match self {
+                    $( $Tok => unsafe { std::str::from_utf8_unchecked($tok_name) }, )*
+                }
+            }
+        }
+    };
+}
+
+define_identifier_set!(Property,
+    // initial registry
+    Calscale,        b"CALSCALE",
+    Method,          b"METHOD",
+    Prodid,          b"PRODID",
+    Version,         b"VERSION",
+    Attach,          b"ATTACH",
+    Categories,      b"CATEGORIES",
+    Class,           b"CLASS",
+    Comment,         b"COMMENT",
+    Description,     b"DESCRIPTION",
+    Geo,             b"GEO",
+    Location,        b"LOCATION",
+    PercentComplete, b"PERCENT-COMPLETE",
+    Priority,        b"PRIORITY",
+    Resources,       b"RESOURCES",
+    Status,          b"STATUS",
+    Summary,         b"SUMMARY",
+    Completed,       b"COMPLETED",
+    Dtend,           b"DTEND",
+    Due,             b"DUE",
+    Dtstart,         b"DTSTART",
+    Duration,        b"DURATION",
+    Freebusy,        b"FREEBUSY",
+    Transp,          b"TRANSP",
+    Tzid,            b"TZID",
+    Tzname,          b"TZNAME",
+    Tzoffsetfrom,    b"TZOFFSETFROM",
+    Tzoffsetto,      b"TZOFFSETTO",
+    Tzurl,           b"TZURL",
+    Attendee,        b"ATTENDEE",
+    Contact,         b"CONTACT",
+    Organizer,       b"ORGANIZER",
+    RecurrenceId,    b"RECURRENCE-ID",
+    RelatedTo,       b"RELATED-TO",
+    Url,             b"URL",
+    Uid,             b"UID",
+    Exdate,          b"EXDATE",
+    Exrule,          b"EXRULE",
+    Rdate,           b"RDATE",
+    Rrule,           b"RRULE",
+    Action,          b"ACTION",
+    Repeat,          b"REPEAT",
+    Trigger,         b"TRIGGER",
+    Created,         b"CREATED",
+    Dtstamp,         b"DTSTAMP",
+    LastModified,    b"LAST-MODIFIED",
+    Sequence,        b"SEQUENCE",
+    RequestStatus,   b"REQUEST-STATUS",
+    // pseudo-properties
+    Begin,           b"BEGIN",
+    End,             b"END",
+);
+
+define_identifier_set!(ParamName,
+    Altrep,        b"ALTREP",
+    Cn,            b"CN",
+    Cutype,        b"CUTYPE",
+    DelegatedFrom, b"DELEGATED-FROM",
+    DelegatedTo,   b"DELEGATED-TO",
+    Dir,           b"DIR",
+    Encoding,      b"ENCODING",
+    Fmttype,       b"FMTTYPE",
+    Fbtype,        b"FBTYPE",
+    Language,      b"LANGUAGE",
+    Member,        b"MEMBER",
+    Partstat,      b"PARTSTAT",
+    Range,         b"RANGE",
+    Related,       b"RELATED",
+    Reltype,       b"RELTYPE",
+    Role,          b"ROLE",
+    Rsvp,          b"RSVP",
+    SentBy,        b"SENT-BY",
+    Tzid,          b"TZID",
+    Value,         b"VALUE",
+);
 
 #[derive(Debug)]
 enum Condition {
     UnexpectedEof,
     Io(std::io::Error),
     Encoding(std::string::FromUtf8Error),
+    BadProperty(Vec<u8>),
+    BadParam(Vec<u8>),
 }
 pub struct Error {
     condition: Condition,
@@ -19,39 +123,62 @@ impl Debug for Error {
 pub type Result<T> = std::result::Result<T, Error>;
 
 pub struct Param {
-    name: Vec<u8>,
+    name: ParamName,
     values: Vec<String>,
 }
 impl Param {
-    pub fn name(&self) -> &str {
-        std::str::from_utf8(&self.name).unwrap()
+    pub fn name(&self) -> ParamName {
+        self.name
     }
-
     pub fn values(&self) -> impl Iterator<Item=&str> {
         self.values.iter().map(|s| s.as_str())
     }
 }
 
 pub struct ContentLine {
-    name: Vec<u8>,
+    name: Property,
     params: Vec<Param>,
     value: String,
+    line: usize,
 }
 impl ContentLine {
-    pub fn name(&self) -> &str {
-        std::str::from_utf8(&self.name).unwrap()
+    pub fn name(&self) -> Property {
+        self.name
     }
 
     pub fn params(&self) -> impl Iterator<Item=&Param> {
         self.params.iter()
     }
 
+    pub fn values_of(&self, pn: ParamName) -> Option<impl Iterator<Item=&str>> {
+        for param in &self.params {
+            if param.name() == pn {
+                return Some(param.values.iter().map(|s| s.as_str()));
+            }
+        }
+        None
+    }
+
+    pub fn value_of(&self, pn: ParamName) -> Option<&str> {
+        for param in &self.params {
+            if param.name() == pn {
+                // XXX: what if len > 1?
+                return param.values().next()
+            }
+        }
+        None
+    }
+
     pub fn value(&self) -> &str {
         &self.value
     }
+
+    pub fn line(&self) -> usize {
+        self.line
+    }
 }
 
-pub struct Parser<S> {
+pub struct Lexer<S> {
     stream: S,
     line: usize,
 }
@@ -68,21 +195,29 @@ fn bad_encoding(line: usize, e: std::string::FromUtf8Error) -> Error {
     Error { condition: Condition::Encoding(e), line }
 }
 
-impl<S: BufRead> Parser<S> {
+fn bad_property(line: usize, s: &[u8]) -> Error {
+    Error { condition: Condition::BadProperty(s.to_owned()), line }
+}
+
+fn bad_param(line: usize, s: &[u8]) -> Error {
+    Error { condition: Condition::BadParam(s.to_owned()), line }
+}
+
+impl<S: BufRead> Lexer<S> {
     pub fn new(stream: S) -> Self {
         let line = 1;
         Self { stream, line }
     }
 
-    pub fn parse_content_line(&mut self) -> Result<Option<ContentLine>> {
+    pub fn lex_content_line(&mut self) -> Result<Option<ContentLine>> {
         let line = self.line;
         if self.stream.fill_buf().map_err(|e| bad_io(line, e))?.is_empty() {
             return Ok(None);
         }
-        let name = self.read_name()?;
+        let name = Property::from_bytes(&self.read_identifier()?).map_err(|e| bad_property(line, e))?;
         let params = self.read_params()?;
         let value = self.read_value()?;
-        Ok(Some(ContentLine { name, params, value }))
+        Ok(Some(ContentLine { name, params, value, line }))
     }
 
     pub fn finish(self) -> S {
@@ -90,7 +225,7 @@ impl<S: BufRead> Parser<S> {
     }
 }
 
-impl<S: BufRead> Parser<S> {
+impl<S: BufRead> Lexer<S> {
     /// Get the next octet, handling "unfolding" and normalization of raw line breaks from CRLF to LF.
     fn peek(&mut self) -> Result<u8> {
         Ok(loop {
@@ -124,7 +259,7 @@ impl<S: BufRead> Parser<S> {
         })
     }
 
-    fn read_name(&mut self) -> Result<Vec<u8>> {
+    fn read_identifier(&mut self) -> Result<Vec<u8>> {
         let mut name = Vec::new();
         Ok(loop {
             match self.peek()? {
@@ -187,13 +322,14 @@ impl<S: BufRead> Parser<S> {
     }
 
     fn read_params(&mut self) -> Result<Vec<Param>> {
+        let line = self.line;
         let mut params = Vec::new();
         Ok('params: loop {
             let c = self.peek()?;
             self.stream.consume(1);
             match c {
                 b';' => {
-                    let param_name = self.read_name()?;
+                    let param_name = self.read_identifier()?;
                     let mut param_values = Vec::new();
                     'param_values: loop {
                         param_values.push(self.read_param_value()?);
@@ -204,7 +340,8 @@ impl<S: BufRead> Parser<S> {
                             _ => unreachable!(),
                         }
                     }
-                    params.push(Param { name: param_name, values: param_values });
+                    let name = ParamName::from_bytes(&param_name).map_err(|e| bad_param(line, e))?;
+                    params.push(Param { name, values: param_values });
                 }
                 b':' => break params,
                 _ => unreachable!(),

@@ -1,6 +1,6 @@
 [package]
 name = "ickle"
-version = "0.2.0"
+version = "0.3.0"
 authors = ["Kaz Wesley <kaz@lambdaverse.org>"]
 edition = "2018"
 description = "A little iCal parser."
@@ -9,3 +9,5 @@ keywords = ["ical"]
 repository = "https://github.com/kazcw/ickle"
 
 [dependencies]
+chrono = "0.4"
+log = "0.4"
