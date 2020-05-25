@@ -1,6 +1,7 @@
 pub mod vevent;
 use std::io::BufRead;
 use std::fmt::{self, Debug};
+use log::trace;
 
 macro_rules! define_identifier_set {
     ( $Name:ident, $( $Tok:ident, $tok_name:expr ),* $(,)? ) => {
@@ -26,7 +27,7 @@ macro_rules! define_identifier_set {
     };
 }
 
-define_identifier_set!(Property,
+define_identifier_set!(IanaProperty,
     // initial registry
     Calscale,        b"CALSCALE",
     Method,          b"METHOD",
@@ -75,15 +76,9 @@ define_identifier_set!(Property,
     LastModified,    b"LAST-MODIFIED",
     Sequence,        b"SEQUENCE",
     RequestStatus,   b"REQUEST-STATUS",
-    // pseudo-properties
-    Begin,           b"BEGIN",
-    End,             b"END",
 );
-impl Default for Property {
-    fn default() -> Self { Property::End }
-}
 
-define_identifier_set!(ParamName,
+define_identifier_set!(IanaParam,
     Altrep,        b"ALTREP",
     Cn,            b"CN",
     Cutype,        b"CUTYPE",
@@ -106,12 +101,57 @@ define_identifier_set!(ParamName,
     Value,         b"VALUE",
 );
 
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub enum Property {
+    Iana(IanaProperty),
+    Extended(String),
+    Begin,
+    End,
+}
+impl Default for Property {
+    fn default() -> Self { Property::End }
+}
+impl Property {
+    fn from_bytes<'s>(s: &'s [u8]) -> std::result::Result<Self, &'s [u8]> {
+        use Property::*;
+        Ok(match s {
+            b"BEGIN" => Begin,
+            b"END" => End,
+            _ => if let Ok(iana) = IanaProperty::from_bytes(s) {
+                Iana(iana)
+            } else if s.starts_with(b"X-") {
+                Extended(String::from_utf8(s.to_owned()).unwrap())
+            } else {
+                return Err(s)
+            }
+        })
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub enum ParamName {
+    Iana(IanaParam),
+    Extended(String),
+}
+impl ParamName {
+    fn from_bytes<'s>(s: &'s [u8]) -> std::result::Result<Self, &'s [u8]> {
+        use ParamName::*;
+        if let Ok(iana) = IanaParam::from_bytes(s) {
+            Ok(Iana(iana))
+        } else if s.starts_with(b"X-") {
+            Ok(Extended(String::from_utf8(s.to_owned()).unwrap()))
+        } else {
+            Err(s)
+        }
+    }
+}
+
 #[derive(Debug)]
 enum Bad {
     Eof,
     Io(std::io::Error),
     Encoding(std::string::FromUtf8Error),
-    Property(Vec<u8>),
+    Property{ name: String, params: Vec<Param>, value: String },
     Param(Vec<u8>),
 }
 impl Bad {
@@ -119,8 +159,8 @@ impl Bad {
     fn is_unrecoverable(&self) -> bool {
         use Bad::*;
         match self {
-            Eof | Io(_) => true,
-            Encoding(_) | Property(_) | Param(_) => false,
+            Eof | Io(..) => true,
+            Encoding(..) | Property{..} | Param(..) => false,
         }
     }
     fn at(self, line: usize) -> Error {
@@ -134,27 +174,27 @@ pub struct Error {
 }
 impl Debug for Error {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "While parsing line {}: {:?}", self.line, self.condition)
+        write!(f, "While lexing line {}: {:?}", self.line, self.condition)
     }
 }
 type Maybe<T> = std::result::Result<T, Bad>;
 pub type Result<T> = std::result::Result<T, Error>;
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Param {
     name: ParamName,
     values: Vec<String>,
 }
 impl Param {
-    pub fn name(&self) -> ParamName {
-        self.name
+    pub fn name(&self) -> &ParamName {
+        &self.name
     }
     pub fn values(&self) -> impl Iterator<Item=&str> {
         self.values.iter().map(|s| s.as_str())
     }
 }
 
-#[derive(Default, Clone)]
+#[derive(Default, Clone, Debug)]
 pub struct ContentLine {
     name: Property,
     params: Vec<Param>,
@@ -163,26 +203,26 @@ pub struct ContentLine {
     line: usize,
 }
 impl ContentLine {
-    pub fn name(&self) -> Property {
-        self.name
+    pub fn name(&self) -> &Property {
+        &self.name
     }
 
     pub fn params(&self) -> impl Iterator<Item=&Param> {
         self.params[..self.num_params].iter()
     }
 
-    pub fn values_of(&self, pn: ParamName) -> Option<impl Iterator<Item=&str>> {
+    pub fn values_of(&self, pn: IanaParam) -> Option<impl Iterator<Item=&str>> {
         for param in &self.params {
-            if param.name() == pn {
+            if param.name() == &ParamName::Iana(pn) {
                 return Some(param.values.iter().map(|s| s.as_str()));
             }
         }
         None
     }
 
-    pub fn value_of(&self, pn: ParamName) -> Option<&str> {
+    pub fn value_of(&self, pn: IanaParam) -> Option<&str> {
         for param in &self.params {
-            if param.name() == pn {
+            if param.name() == &ParamName::Iana(pn) {
                 // XXX: what if len > 1?
                 return param.values().next()
             }
@@ -214,7 +254,7 @@ impl<S: BufRead> Lexer<S> {
         Self { stream, content, ident_buf, line }
     }
 
-    pub fn lex_content_line(&mut self) -> Result<Option<&mut ContentLine>> {
+    pub fn lex_content_line(&mut self) -> Result<Option<&ContentLine>> {
         let line = self.line;
         if self.stream.fill_buf().map_err(|e| Bad::Io(e).at(line))?.is_empty() {
             return Ok(None);
@@ -236,9 +276,11 @@ impl<S: BufRead> Lexer<S> {
         self.content = content;
         self.ident_buf = ident_buf;
         match result {
-            Ok(name) => {
+            Ok((num_params, name)) => {
                 self.content.name = name;
-                Ok(Some(&mut self.content))
+                self.content.num_params = num_params;
+                trace!("lex {}: {:?}", line, self.content);
+                Ok(Some(&self.content))
             }
             Err(e) => {
                 if !e.is_unrecoverable() {
@@ -249,12 +291,18 @@ impl<S: BufRead> Lexer<S> {
         }
     }
 
-    fn do_lex_content_line(&mut self, ident_buf: &mut Vec<u8>, value_buf: &mut Vec<u8>, params: &mut Vec<Param>) -> Maybe<Property> {
+    fn do_lex_content_line(&mut self, ident_buf: &mut Vec<u8>, value_buf: &mut Vec<u8>, params: &mut Vec<Param>) -> Maybe<(usize, Property)> {
         self.read_identifier(ident_buf)?;
-        let name = Property::from_bytes(ident_buf).map_err(|e| Bad::Property(e.to_owned()))?;
-        self.read_params(params, ident_buf)?;
+        let name = Property::from_bytes(ident_buf).map_err(|e| e.to_owned());
+        let num_params = self.read_params(params, ident_buf)?;
         self.read_value(value_buf)?;
-        Ok(name)
+        let name = name.map_err(|e|
+            Bad::Property {
+                name: String::from_utf8(e).unwrap(),
+                params: params[..num_params].to_owned(),
+                value: String::from_utf8(value_buf.clone()).expect("non-utf8 value in unknown property type")
+            })?;
+        Ok((num_params, name))
     }
 
     pub fn finish(self) -> S {
@@ -369,13 +417,19 @@ impl<S: BufRead> Lexer<S> {
                     } else {
                         params.push(Param { name, values: Vec::new() });
                     }
+                    let c = self.peek()?;
+                    assert_eq!(c, b'=', "Illegal byte in param name. Recovery from this is unimplemented."); // FIXME
+                    self.stream.consume(1);
                     'param_values: loop {
                         let param_value = self.read_param_value()?;
                         params[i].values.push(param_value);
                         match self.peek()? {
                             b',' => continue,
                             b';' => break 'param_values,
-                            b':' => break 'params,
+                            b':' => {
+                                self.stream.consume(1);
+                                break 'params;
+                            }
                             _ => unreachable!(),
                         }
                     }

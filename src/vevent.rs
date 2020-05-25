@@ -1,14 +1,16 @@
 use chrono::{NaiveDate, NaiveDateTime};
-use crate::{ContentLine, Property, ParamName};
+use crate::{ContentLine, Property, IanaProperty, IanaParam};
 use std::str::FromStr;
 use log::debug;
 
+#[derive(Debug)]
 pub enum DateTime {
     Utc(NaiveDateTime),
     Local(NaiveDateTime, String),
     Floating(NaiveDateTime),
 }
 
+#[derive(Debug)]
 pub enum When {
     Date(NaiveDate),
     DateTime(DateTime),
@@ -24,10 +26,13 @@ impl From<DateTime> for When {
     }
 }
 
+#[derive(Debug)]
 pub enum VEventProperty {
     Dtstart(When),
     Dtend(When),
     Summary(String),
+    Unknown,
+    Extended(ContentLine),
 }
 
 #[derive(Debug)]
@@ -81,53 +86,59 @@ fn parse_datetime(s: &str, tzid: Option<&str>) -> std::result::Result<DateTime, 
     })
 }
 
-fn parse_when(coli: &mut ContentLine) -> std::result::Result<When, Bad> {
-    Ok(match coli.value_of(ParamName::Value) {
+fn parse_when(coli: &ContentLine) -> std::result::Result<When, Bad> {
+    Ok(match coli.value_of(IanaParam::Value) {
         Some("DATE") => parse_date(coli.value())?.into(),
         _ => {
-            let tzid = coli.value_of(ParamName::Tzid);
+            let tzid = coli.value_of(IanaParam::Tzid);
             parse_datetime(coli.value(), tzid)?.into()
         }
     })
 }
 
-pub fn parse_property(coli: &mut ContentLine) -> Result<Option<VEventProperty>> {
+pub fn parse_property(coli: &ContentLine) -> Result<Option<VEventProperty>> {
     use VEventProperty::*;
     let line = coli.line();
-    Ok(Some(match coli.name() {
-        Property::Dtstart => Dtstart(parse_when(coli).map_err(|bad| Error { bad, line } )?),
-        Property::Dtend => Dtend(parse_when(coli).map_err(|bad| Error { bad, line } )?),
-        Property::Summary => Summary(coli.value().to_owned()),
-        Property::Dtstamp |
-        Property::Uid |
-        Property::Class |
-        Property::Created |
-        Property::Description |
-        Property::Geo |
-        Property::LastModified |
-        Property::Location |
-        Property::Organizer |
-        Property::Priority |
-        Property::Sequence |
-        Property::Status |
-        Property::Transp |
-        Property::Url |
-        Property::RecurrenceId |
-        Property::Rrule |
-        Property::Duration |
-        Property::Attach |
-        Property::Attendee |
-        Property::Categories |
-        Property::Comment |
-        Property::Contact |
-        Property::Exdate |
-        Property::RequestStatus |
-        Property::RelatedTo |
-        Property::Resources |
-        Property::Rdate => {
-            debug!("VEVENT property not implemented: {}", coli.name().as_str());
-            return Ok(None);
+    let iana = match coli.name() {
+        Property::Iana(iana) => iana,
+        Property::Extended(_) => return Ok(Some(Extended(coli.clone()))),
+        Property::End => return Ok(None),
+        Property::Begin => todo!(),
+    };
+    Ok(Some(match iana {
+        IanaProperty::Dtstart => Dtstart(parse_when(coli).map_err(|bad| Error { bad, line } )?),
+        IanaProperty::Dtend => Dtend(parse_when(coli).map_err(|bad| Error { bad, line } )?),
+        IanaProperty::Summary => Summary(coli.value().to_owned()),
+        IanaProperty::Dtstamp |
+        IanaProperty::Uid |
+        IanaProperty::Class |
+        IanaProperty::Created |
+        IanaProperty::Description |
+        IanaProperty::Geo |
+        IanaProperty::LastModified |
+        IanaProperty::Location |
+        IanaProperty::Organizer |
+        IanaProperty::Priority |
+        IanaProperty::Sequence |
+        IanaProperty::Status |
+        IanaProperty::Transp |
+        IanaProperty::Url |
+        IanaProperty::RecurrenceId |
+        IanaProperty::Rrule |
+        IanaProperty::Duration |
+        IanaProperty::Attach |
+        IanaProperty::Attendee |
+        IanaProperty::Categories |
+        IanaProperty::Comment |
+        IanaProperty::Contact |
+        IanaProperty::Exdate |
+        IanaProperty::RequestStatus |
+        IanaProperty::RelatedTo |
+        IanaProperty::Resources |
+        IanaProperty::Rdate => {
+            debug!("VEVENT property not implemented: {}", iana.as_str());
+            Unknown
         }
-        _ => return Ok(None)
+        _ => Unknown
     }))
 }
