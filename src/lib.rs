@@ -79,6 +79,9 @@ define_identifier_set!(Property,
     Begin,           b"BEGIN",
     End,             b"END",
 );
+impl Default for Property {
+    fn default() -> Self { Property::End }
+}
 
 define_identifier_set!(ParamName,
     Altrep,        b"ALTREP",
@@ -104,15 +107,29 @@ define_identifier_set!(ParamName,
 );
 
 #[derive(Debug)]
-enum Condition {
-    UnexpectedEof,
+enum Bad {
+    Eof,
     Io(std::io::Error),
     Encoding(std::string::FromUtf8Error),
-    BadProperty(Vec<u8>),
-    BadParam(Vec<u8>),
+    Property(Vec<u8>),
+    Param(Vec<u8>),
 }
+impl Bad {
+    /// Return true if it will definitely not be possible to lex any further data.
+    fn is_unrecoverable(&self) -> bool {
+        use Bad::*;
+        match self {
+            Eof | Io(_) => true,
+            Encoding(_) | Property(_) | Param(_) => false,
+        }
+    }
+    fn at(self, line: usize) -> Error {
+        Error { condition: self, line }
+    }
+}
+
 pub struct Error {
-    condition: Condition,
+    condition: Bad,
     line: usize,
 }
 impl Debug for Error {
@@ -120,8 +137,10 @@ impl Debug for Error {
         write!(f, "While parsing line {}: {:?}", self.line, self.condition)
     }
 }
+type Maybe<T> = std::result::Result<T, Bad>;
 pub type Result<T> = std::result::Result<T, Error>;
 
+#[derive(Clone)]
 pub struct Param {
     name: ParamName,
     values: Vec<String>,
@@ -135,9 +154,11 @@ impl Param {
     }
 }
 
+#[derive(Default, Clone)]
 pub struct ContentLine {
     name: Property,
     params: Vec<Param>,
+    num_params: usize,
     value: String,
     line: usize,
 }
@@ -147,7 +168,7 @@ impl ContentLine {
     }
 
     pub fn params(&self) -> impl Iterator<Item=&Param> {
-        self.params.iter()
+        self.params[..self.num_params].iter()
     }
 
     pub fn values_of(&self, pn: ParamName) -> Option<impl Iterator<Item=&str>> {
@@ -180,44 +201,60 @@ impl ContentLine {
 
 pub struct Lexer<S> {
     stream: S,
+    content: ContentLine,
+    ident_buf: Vec<u8>,
     line: usize,
-}
-
-fn bad_eof(line: usize) -> Error {
-    Error { condition: Condition::UnexpectedEof, line }
-}
-
-fn bad_io(line: usize, e: std::io::Error) -> Error {
-    Error { condition: Condition::Io(e), line }
-}
-
-fn bad_encoding(line: usize, e: std::string::FromUtf8Error) -> Error {
-    Error { condition: Condition::Encoding(e), line }
-}
-
-fn bad_property(line: usize, s: &[u8]) -> Error {
-    Error { condition: Condition::BadProperty(s.to_owned()), line }
-}
-
-fn bad_param(line: usize, s: &[u8]) -> Error {
-    Error { condition: Condition::BadParam(s.to_owned()), line }
 }
 
 impl<S: BufRead> Lexer<S> {
     pub fn new(stream: S) -> Self {
+        let content = ContentLine { name: Property::End, params: Vec::new(), value: String::new(), line: 0, num_params: 0 };
+        let ident_buf = Vec::new();
         let line = 1;
-        Self { stream, line }
+        Self { stream, content, ident_buf, line }
     }
 
-    pub fn lex_content_line(&mut self) -> Result<Option<ContentLine>> {
+    pub fn lex_content_line(&mut self) -> Result<Option<&mut ContentLine>> {
         let line = self.line;
-        if self.stream.fill_buf().map_err(|e| bad_io(line, e))?.is_empty() {
+        if self.stream.fill_buf().map_err(|e| Bad::Io(e).at(line))?.is_empty() {
             return Ok(None);
         }
-        let name = Property::from_bytes(&self.read_identifier()?).map_err(|e| bad_property(line, e))?;
-        let params = self.read_params()?;
-        let value = self.read_value()?;
-        Ok(Some(ContentLine { name, params, value, line }))
+        // Take buffers, operate, restore buffers (even if error), return result.
+        let mut content = std::mem::replace(&mut self.content, Default::default());
+        let mut ident_buf = std::mem::replace(&mut self.ident_buf, Default::default());
+        let mut value_buf = std::mem::replace(&mut content.value, Default::default()).into_bytes();
+        let result = self.do_lex_content_line(&mut ident_buf, &mut value_buf, &mut content.params);
+        let value = match String::from_utf8(value_buf) {
+            Ok(k) => k,
+            Err(e) => {
+                let mut buf = e.into_bytes();
+                buf.clear();
+                String::from_utf8(buf).unwrap()
+            }
+        };
+        content.value = value;
+        self.content = content;
+        self.ident_buf = ident_buf;
+        match result {
+            Ok(name) => {
+                self.content.name = name;
+                Ok(Some(&mut self.content))
+            }
+            Err(e) => {
+                if !e.is_unrecoverable() {
+                    // TODO: run out the rest of the line...
+                }
+                Err(e.at(line))
+            }
+        }
+    }
+
+    fn do_lex_content_line(&mut self, ident_buf: &mut Vec<u8>, value_buf: &mut Vec<u8>, params: &mut Vec<Param>) -> Maybe<Property> {
+        self.read_identifier(ident_buf)?;
+        let name = Property::from_bytes(ident_buf).map_err(|e| Bad::Property(e.to_owned()))?;
+        self.read_params(params, ident_buf)?;
+        self.read_value(value_buf)?;
+        Ok(name)
     }
 
     pub fn finish(self) -> S {
@@ -227,22 +264,18 @@ impl<S: BufRead> Lexer<S> {
 
 impl<S: BufRead> Lexer<S> {
     /// Get the next octet, handling "unfolding" and normalization of raw line breaks from CRLF to LF.
-    fn peek(&mut self) -> Result<u8> {
+    fn peek(&mut self) -> Maybe<u8> {
         Ok(loop {
-            let line = self.line;
-            let c = *self.stream.fill_buf().map_err(|e| bad_io(line, e))?
-                .get(0).ok_or_else(|| bad_eof(line))?;
+            let c = *self.stream.fill_buf().map_err(Bad::Io)?.get(0).ok_or(Bad::Eof)?;
             match c {
                 b'\r' => {
                     self.stream.consume(1);
-                    let c = *self.stream.fill_buf().map_err(|e| bad_io(line, e))?
-                        .get(0).ok_or_else(|| bad_eof(line))?;
+                    let c = *self.stream.fill_buf().map_err(Bad::Io)?.get(0).ok_or(Bad::Eof)?;
                     self.stream.consume(1);
                     match c {
                         b'\n' => {
                             self.line += 1;
-                            let line = self.line;
-                            let c = self.stream.fill_buf().map_err(|e| bad_io(line, e))?.get(0);
+                            let c = self.stream.fill_buf().map_err(Bad::Io)?.get(0);
                             match c {
                                 Some(b' ') | Some(b'\t') => {
                                     self.stream.consume(1);
@@ -259,20 +292,20 @@ impl<S: BufRead> Lexer<S> {
         })
     }
 
-    fn read_identifier(&mut self) -> Result<Vec<u8>> {
-        let mut name = Vec::new();
+    fn read_identifier(&mut self, ident_buf: &mut Vec<u8>) -> Maybe<()> {
+        ident_buf.clear();
         Ok(loop {
             match self.peek()? {
                 c @ b'-' | c @ b'A'..=b'Z' | c @ b'a'..=b'z' | c @ b'0'..=b'9' => {
-                    name.push(c);
+                    ident_buf.push(c);
                     self.stream.consume(1);
                 }
-                _ => break name,
+                _ => break,
             }
         })
     }
 
-    fn read_escaped(&mut self) -> Result<u8> {
+    fn read_escaped(&mut self) -> Maybe<u8> {
         self.stream.consume(1);
         Ok(match self.peek()? {
             b'n' => b'\n',
@@ -283,7 +316,7 @@ impl<S: BufRead> Lexer<S> {
         })
     }
 
-    fn read_quoted(&mut self) -> Result<Vec<u8>> {
+    fn read_quoted(&mut self) -> Maybe<Vec<u8>> {
         let mut param_value = Vec::new();
         Ok(loop {
             match self.peek()? {
@@ -297,7 +330,7 @@ impl<S: BufRead> Lexer<S> {
         })
     }
 
-    fn read_param_value(&mut self) -> Result<String> {
+    fn read_param_value(&mut self) -> Maybe<String> {
         let param_value = if self.peek()? == b'"' {
             self.stream.consume(1);
             let param_value = self.read_quoted()?;
@@ -317,51 +350,59 @@ impl<S: BufRead> Lexer<S> {
             }
             param_value
         };
-        let line = self.line;
-        String::from_utf8(param_value).map_err(|e| bad_encoding(line, e))
+        String::from_utf8(param_value).map_err(Bad::Encoding)
     }
 
-    fn read_params(&mut self) -> Result<Vec<Param>> {
-        let line = self.line;
-        let mut params = Vec::new();
-        Ok('params: loop {
+    fn read_params(&mut self, params: &mut Vec<Param>, ident_buf: &mut Vec<u8>) -> Maybe<usize> {
+        let mut i = 0;
+        params.clear();
+        'params: loop {
             let c = self.peek()?;
             self.stream.consume(1);
             match c {
                 b';' => {
-                    let param_name = self.read_identifier()?;
-                    let mut param_values = Vec::new();
+                    self.read_identifier(ident_buf)?;
+                    let name = ParamName::from_bytes(ident_buf).map_err(|e| Bad::Param(e.to_owned()))?;
+                    if let Some(param) = params.get_mut(i) {
+                        param.name = name;
+                        param.values.clear();
+                    } else {
+                        params.push(Param { name, values: Vec::new() });
+                    }
                     'param_values: loop {
-                        param_values.push(self.read_param_value()?);
+                        let param_value = self.read_param_value()?;
+                        params[i].values.push(param_value);
                         match self.peek()? {
                             b',' => continue,
                             b';' => break 'param_values,
-                            b':' => break 'params params,
+                            b':' => break 'params,
                             _ => unreachable!(),
                         }
                     }
-                    let name = ParamName::from_bytes(&param_name).map_err(|e| bad_param(line, e))?;
-                    params.push(Param { name, values: param_values });
+                    i += 1;
                 }
-                b':' => break params,
+                b':' => break 'params,
                 _ => unreachable!(),
             }
-        })
+        }
+        Ok(i)
     }
 
-    fn read_value(&mut self) -> Result<String> {
-        let mut value = Vec::new();
+    fn read_value(&mut self, value_buf: &mut Vec<u8>) -> Maybe<()> {
+        value_buf.clear();
         loop {
             match self.peek()? {
                 b'\n' => break,
-                b'\\' => value.push(self.read_escaped()?),
+                b'\\' => {
+                    let c = self.read_escaped()?;
+                    value_buf.push(c);
+                }
                 c => {
-                    value.push(c);
+                    value_buf.push(c);
                     self.stream.consume(1);
                 }
             }
         }
-        let line = self.line;
-        String::from_utf8(value).map_err(|e| bad_encoding(line, e))
+        Ok(())
     }
 }
