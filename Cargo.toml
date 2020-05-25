@@ -6,5 +6,6 @@ edition = "2018"
 description = "A little iCal parser."
 license = "MIT OR Apache-2.0"
 keywords = ["ical"]
+repository = "https://github.com/kazcw/ickle"
 
 [dependencies]
