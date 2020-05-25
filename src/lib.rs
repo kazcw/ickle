@@ -1,4 +1,5 @@
 use std::io::BufRead;
+use std::fmt::{self, Debug};
 
 pub trait Handler {
     fn handle(&mut self, name: Vec<u8>, params: Vec<(Vec<u8>, Vec<String>)>, value: String);
@@ -13,6 +14,11 @@ enum Condition {
 pub struct Error {
     condition: Condition,
     line: usize,
+}
+impl Debug for Error {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "While parsing line {}: {:?}", self.line, self.condition)
+    }
 }
 pub type Result<T> = std::result::Result<T, Error>;
 
