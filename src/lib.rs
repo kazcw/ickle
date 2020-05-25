@@ -1,10 +1,6 @@
 use std::io::BufRead;
 use std::fmt::{self, Debug};
 
-pub trait Handler {
-    fn handle(&mut self, name: Vec<u8>, params: Vec<(Vec<u8>, Vec<String>)>, value: String);
-}
-
 #[derive(Debug)]
 enum Condition {
     UnexpectedEof,
@@ -22,8 +18,41 @@ impl Debug for Error {
 }
 pub type Result<T> = std::result::Result<T, Error>;
 
-pub struct Parser<'s, S> {
-    stream: &'s mut S,
+pub struct Param {
+    name: Vec<u8>,
+    values: Vec<String>,
+}
+impl Param {
+    pub fn name(&self) -> &str {
+        std::str::from_utf8(&self.name).unwrap()
+    }
+
+    pub fn values(&self) -> impl Iterator<Item=&str> {
+        self.values.iter().map(|s| s.as_str())
+    }
+}
+
+pub struct ContentLine {
+    name: Vec<u8>,
+    params: Vec<Param>,
+    value: String,
+}
+impl ContentLine {
+    pub fn name(&self) -> &str {
+        std::str::from_utf8(&self.name).unwrap()
+    }
+
+    pub fn params(&self) -> impl Iterator<Item=&Param> {
+        self.params.iter()
+    }
+
+    pub fn value(&self) -> &str {
+        &self.value
+    }
+}
+
+pub struct Parser<S> {
+    stream: S,
     line: usize,
 }
 
@@ -39,12 +68,29 @@ fn bad_encoding(line: usize, e: std::string::FromUtf8Error) -> Error {
     Error { condition: Condition::Encoding(e), line }
 }
 
-impl<'s, S: BufRead> Parser<'s, S> {
-    pub fn new(stream: &'s mut S) -> Self {
+impl<S: BufRead> Parser<S> {
+    pub fn new(stream: S) -> Self {
         let line = 1;
         Self { stream, line }
     }
 
+    pub fn parse_content_line(&mut self) -> Result<Option<ContentLine>> {
+        let line = self.line;
+        if self.stream.fill_buf().map_err(|e| bad_io(line, e))?.is_empty() {
+            return Ok(None);
+        }
+        let name = self.read_name()?;
+        let params = self.read_params()?;
+        let value = self.read_value()?;
+        Ok(Some(ContentLine { name, params, value }))
+    }
+
+    pub fn finish(self) -> S {
+        self.stream
+    }
+}
+
+impl<S: BufRead> Parser<S> {
     /// Get the next octet, handling "unfolding" and normalization of raw line breaks from CRLF to LF.
     fn peek(&mut self) -> Result<u8> {
         Ok(loop {
@@ -140,7 +186,7 @@ impl<'s, S: BufRead> Parser<'s, S> {
         String::from_utf8(param_value).map_err(|e| bad_encoding(line, e))
     }
 
-    fn read_params(&mut self) -> Result<Vec<(Vec<u8>, Vec<String>)>> {
+    fn read_params(&mut self) -> Result<Vec<Param>> {
         let mut params = Vec::new();
         Ok('params: loop {
             let c = self.peek()?;
@@ -158,7 +204,7 @@ impl<'s, S: BufRead> Parser<'s, S> {
                             _ => unreachable!(),
                         }
                     }
-                    params.push((param_name, param_values));
+                    params.push(Param { name: param_name, values: param_values });
                 }
                 b':' => break params,
                 _ => unreachable!(),
@@ -181,21 +227,4 @@ impl<'s, S: BufRead> Parser<'s, S> {
         let line = self.line;
         String::from_utf8(value).map_err(|e| bad_encoding(line, e))
     }
-
-    fn parse(mut self, handler: &mut impl Handler) -> Result<()> {
-        let mut line = self.line;
-        while !self.stream.fill_buf().map_err(|e| bad_io(line, e))?.is_empty() {
-            let name = self.read_name()?;
-            let params = self.read_params()?;
-            let value = self.read_value()?;
-            handler.handle(name, params, value);
-            line = self.line;
-        }
-        Ok(())
-    }
-}
-
-pub fn parse(stream: &mut impl BufRead, handler: &mut impl Handler) -> Result<()> {
-    let parser = Parser::new(stream);
-    parser.parse(handler)
 }
