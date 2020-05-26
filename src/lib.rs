@@ -1,8 +1,10 @@
 pub mod vevent;
 use std::io::BufRead;
 use std::fmt::{self, Debug};
+use std::str::FromStr;
 use log::trace;
 
+#[macro_export]
 macro_rules! define_identifier_set {
     ( $Name:ident, $( $Tok:ident, $tok_name:expr ),* $(,)? ) => {
         #[derive(Debug, PartialEq, Eq, Copy, Clone)]
@@ -22,6 +24,12 @@ macro_rules! define_identifier_set {
                 match self {
                     $( $Tok => unsafe { std::str::from_utf8_unchecked($tok_name) }, )*
                 }
+            }
+        }
+        impl FromStr for $Name {
+            type Err = ();
+            fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+                $Name::from_bytes(s.as_bytes()).map_err(|_| ())
             }
         }
     };
